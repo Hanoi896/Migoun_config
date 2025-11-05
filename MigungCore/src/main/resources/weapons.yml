@@ -1,0 +1,6 @@
+CRYSTAL_WAND:
+  material: BLAZE_ROD
+  display_name: "&b수정 마법봉"
+  properties:
+    casting_time_modifier: -0.2 # 시전 시간 20% 감소
+    cooldown_reduction: 0.1   # 모든 스킬 쿨타임 10% 감소

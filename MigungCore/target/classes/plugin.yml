@@ -1,0 +1,26 @@
+name: MigungCore
+version: 1.0.0
+main: io.github.han896.MigungCore
+api-version: '1.20'
+author: Han896
+description: 미궁 프로젝트의 핵심 플러그인
+commands:
+  # 이 명령어들은 플레이어가 사용하는 것이므로 그대로 둡니다.
+  migung:
+    description: 미궁 프로젝트의 핵심 명령어입니다.
+    usage: /<command> skills all
+  myskills:
+    description: 자신의 스킬 목록을 확인합니다.
+    aliases: [내스킬, 스킬]
+  stats:
+    description: 자신의 스탯 정보를 확인하고 포인트를 분배합니다.
+    aliases: [스탯, 내정보]
+  magic:
+    description: 마법을 관리합니다.
+    aliases: [마법, spells]
+
+  # (핵심!) 기존의 '리세마라'와 '스텟포인트'를 삭제하고, 이 코드로 교체합니다.
+  migungadmin:
+    description: 미궁 프로젝트의 관리자용 명령어입니다.
+    permission: migung.admin # 이 권한 하나로 모든 하위 명령어를 제어합니다.
+    aliases: [mga]

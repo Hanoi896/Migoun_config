@@ -1,0 +1,610 @@
+좋아 — 그럼 **코드 없이(순수 기획)** `MigungCore`의 모든 내부 설계·운영 흐름을 **매우 세세하게** 정리해줄게.
+먼저 내가 스스로 세운 **‘최상의 결과물’(루브릭)** 을 짧게 제시하고, 그 기준에 따라 모듈별로 완전한 기획(데이터 구조, 이벤트 흐름, UI/명령어, 관리자 도구, 테스트/검증 기준, 예외 처리 등)을 단계별로 풀어줄게.
+
+# 1) 최상의 결과물(루브릭)
+
+1. **완전성**: 설정파일(`skills.yml`, `dungeons.yml` 등) + 플러그인 인터랙션 설계가 맵·몹·NPC 자료와 1:1로 매핑되어 실제 구현이 바로 가능해야 함.
+2. **일관성**: 난이도/판정/스킬/스토리 규칙이 모순 없이 정의되어야 함.
+3. **확장성**: 향후 층(11~100), 스킬·몹 추가가 쉬운 구조여야 함(데이터 드리븐).
+4. **성능 안전성**: 라즈베리파이 환경(저자원)에서도 동작 가능하도록 비동기·캐시·제한 정책 포함.
+5. **운영성**: 운영자가 실시간으로 확인·조정 가능한 관리자 명령어와 로그·백업·모니터링 방안 포함.
+6. **테스트 가능성**: 유닛·통합·플레이테스트 시나리오와 통과 기준이 명시되어야 함.
+
+아래 기획은 위 루브릭을 충족하도록 구성함.
+
+---
+
+# 2) 시스템 개요 (목표와 책임 범위)
+
+**MigungCore**는 ‘미궁 시스템의 규칙·상태·인터렉션 중추’로서 아래 책임을 가진다.
+
+* 플레이어 메타(레벨·스탯·칭호) 관리
+* 스킬(획득·조건·발동) 시스템
+* 층계(던전)·기믹 컨트롤
+* 난이도(이지/노말/하드/Alon) 해석 및 적용
+* Quest / NPC 진행 상태의 중앙 저장소
+* 다른 플러그인(MythicMobs, zNPCs, Multiverse 등)과의 조정자 역할
+
+---
+
+# 3) 모듈별 세부 기획
+
+각 모듈은 동일한 패턴으로 기획: 목적 → 데이터 모델(필드) → 플레이어 인터랙션 → 관리자 인터랙션 → 이벤트/플로우 → 예외/성능 고려 → 테스트/수락 기준
+
+---
+
+## A. PlayerSystem (플레이어 통합계)
+
+**목적**: 플레이어의 영구 데이터(레벨·스탯·진행)를 안전하게 보존하고, 게임 내 각종 판정의 입력으로 사용.
+
+### 데이터 모델 (예시 필드)
+
+* playerId(UUID)
+* displayName
+* difficulty (Easy/Normal/Hard/Alon)
+* level, exp, expToNext
+* stats: {STR, AGI, INT, VIT, WIS}
+* skillList: [skillId, acquiredAt, tier, progressData]
+* titles: [titleId, activeFlag]
+* questProgress: {questId: 상태/단계/타임스탬프}
+* flags: {storyChoices, diedTimes, lastDeathAt}
+* metadata: lastSeenLocation, currentDungeonFloor
+
+> 저장소: 기본은 **SQLite**(파일) → 소규모/라즈베리파이에 적합. 장기/멀티서버 전환 시 MySQL 마이그레이션 가능.
+
+### 플레이어 측 인터랙션
+
+* 명령어: `/status`, `/stats`, `/skills`, `/difficulty`(초기 선택), `/title set <id>`
+* GUI: `/skills` → 획득 스킬/진행도 표시(아이콘 + 조건 %)
+* 레벨업 팝업(액션바+토스트 메시지)
+
+### 관리자/운영자 인터랙션
+
+* `/mig admin view <player>` → 모든 데이터 덤프(읽기)
+* `/mig admin setstat <player> <stat> <value>`
+* 백업/복구 명령
+
+### 이벤트 / 흐름
+
+* 몹 처치 → `PlayerSystem.onKill` 호출 → EXP 계산 → 레벨업 판정 → 스킬 언락 검사
+* 퀘스트 완료 → rewards 지급 + 기록 갱신
+
+### 예외/성능 고려
+
+* 빈번한 쓰기 작업은 메모리 캐시 → 주기적 flush (예: 30s)
+* 로그아웃 직전 동기 저장 보장
+* 부하 발생 시 캐시 TTL 증가 및 비동기 처리
+
+### 테스트 기준
+
+* 데이터 저장 100% 무결성(로그인·로그아웃 반복 100회)
+* 동시 20명 접속 시 평균 응답 지연 < 100ms
+
+---
+
+## B. SkillSystem (스킬/해금/발동)
+
+**목적**: `skills.txt` 기반의 모든 스킬 규칙(패시브/액티브/합체/진화/궁극)을 데이터로 관리하고 발동한다.
+
+### 데이터 모델 (스킬 메타)
+
+* skillId (ex: skill_kembang)
+* displayName
+* type: PASSIVE/ACTIVE/TRANSFORM
+* tier: 기본/합체/진화/궁극
+* unlockConditions: {requirements: [{type:stat/skill/quest/killCount}, value], hidden:Boolean}
+* cooldown, manaCost, staminaCost
+* effectSpec: (데이터 드리븐으로 MythicMobs 스킬 또는 커스텀 이펙트 호출 명시)
+* stackingRules, duration, targetType(player/area/enemy)
+
+### 구현 원칙
+
+* 데이터파일 (`skills.yml`) 만으로 신규 스킬 추가 가능.
+* 합체/진화 스킬은 `SkillUnlockManager`가 주기적/이벤트 기반(레벨업, 특정 퀘스트 완료 등)으로 체크.
+* 발동은 두 단계: **검증(쿨다운·자원·조건)** → **실행(이펙트 호출, 데미지 산출)**
+
+### 플레이어 UI/명령
+
+* `/skills` GUI(탭: 보유, 해금조건, 미획득)
+* 액티브 캐스팅: 키바인드 또는 `/cast <skill>` (서버 환경 고려 — 기본은 명령어/GUI)
+* 액션바로 쿨다운/리소스 표시(PlaceholderAPI 사용)
+
+### 관리자 도구
+
+* `/mig skill debug <player> <skill>` → 시뮬레이션 발동
+* `/mig skill unlock <player> <skill>` → 강제 해금
+
+### 이벤트 & 플로우 예
+
+* 플레이어가 특정 몬스터 100마리 처치 → `killCount` 증가 → 합체 조건 충족 → `onUnlock` 알림 및 보상
+* 스킬 발동 실패(자원 부족) → 실패 애니메이션 + 짧은 쿨다운(페널티)
+
+### 예외/밸런스
+
+* 궁극 스킬 조건은 복합(다중 퀘스트·아이템)으로 설정, 실수로 빨리 깰 우려가 있으니 중복 체크 필요.
+* 스킬 누적·중첩 규칙을 엄격히 정의(예: 동일 버프 2중 적용 불가 또는 약화 합산).
+
+### 테스트/수용 기준
+
+* 각 스킬의 발동/효과가 문서대로 90% 일치(시뮬레이션 1000회)
+* 합체 해금 조건 오탐률 0%
+
+---
+
+## C. DungeonSystem (층계/맵/기믹)
+
+**목적**: `맵.txt`의 층계별 환경·기믹·스폰 규칙을 실제 월드 전환·상태로 반영.
+
+### 데이터 모델 (층 엔트리)
+
+* floorId (ex: floor_1_4_forest)
+* displayName
+* difficultyVariants: {Easy: overrides, Normal: ..., Hard: ..., Alon: ...}
+* environment: {visualTag, ambientSound, lightLevel}
+* spawnTable: [{mobId, weight, minCount, maxCount, spawnCondition}]
+* regionBounds: multiverse world + region id (WorldGuard region name)
+* gimmicks: [{id, type: trap/puzzle/environmental, trigger, effect}]
+* bossRoom: {bossId, triggerConditions, failConditions}
+* specialItems: [list of item spawns with probability]
+
+### 월드 관리 원칙
+
+* 각 층은 Multiverse world 하나 또는 WorldGuard region으로 관리.
+* 맵 전이: 포탈/문 상호작용 → 플레이어 위치 변경 + meta(floorId) 세트.
+
+### 기믹 예시
+
+* Hard 모드의 붉은 물: 접촉 이벤트 → `DungeonSystem.applyDebuff(player, "disease")`
+* Alon 모드: HUD 관련 메시지 비활성화, 스폰 테이블은 동일하되 오브젝트/NPC 비활성화
+
+### 보스 룸 플로우(10층 하게-하)
+
+1. 플레이어가 보스문 열기 → 체크(파티 조건, 특정 퀘스트 완료 여부)
+2. 인트로 컷씬(자막 + 사운드)
+3. 보스 스폰(MythicMobs 보스) + 페이즈 타이머 관리
+4. 특정 페이즈 도달 시 환경 변화(예: 바닥 독, 소환)
+5. 보스 사망 → 보상 스폰, 다음 층 게이트 오픈, 스토리 퀘스트 업데이트
+
+### 관리자 도구
+
+* `/mig floor info <floorId>` → 현재 active players, mobCounts, active gimmicks
+* `/mig floor spawnboss <bossId>` 테스트 전용
+
+### 성능 고려
+
+* 층 별 엔티티 캡 설정 (예: floor_1_4 max 60 entities)
+* 활성 플레이어가 없으면(30s) 자동 스폰 중지/체크 포인트로 변환
+* 퍼포먼스 위험 기믹(대량 이펙트/소환)은 서버 TPS 저하 시 비활성화 옵션 제공
+
+### 테스트/수용
+
+* 각 층 스폰 밸런스 테스트(1~20플레이 반복) → 평균 컨텐트 진행시간이 디자인 의도 ±30%
+* 보스 전투 재현성: 기믹이 항상 작동(10/10 경우)
+
+---
+
+## D. MobIntegration (MythicMobs 연동 계획)
+
+**목적**: 몹 데이터(몹.txt)를 MythicMobs 포맷과 연동하여 전투·드랍·특수행동을 처리.
+
+### 매핑 규칙
+
+* 몹ID = `mob_<name>` (예: mob_big_rat)
+* 등급 필드(일반/엘리트/보스) → MythicMobs 태그로 저장
+* AI 행동 정의는 MythicMobs 스크립트로 제작되지만, MigungCore는 다음을 담당:
+
+  * 몹 스폰 시 난이도 보정(HP, DMG, 스킬 확률)
+  * 처치 시 EXP/Quest 연계(이벤트 훅)
+  * 특별 행동(도둑 몹이 인벤 훔치기 등)은 MigungCore가 이벤트 훅으로 보완
+
+### 흐름
+
+* `spawnTable` → MythicMobs에게 spawn request
+* MythicMobs가 spawn 완료 콜백 → MigungCore가 메타(등급, 드랍 테이블 참조) 등록
+* 몹 데스 이벤트 → MigungCore.onMobDeath 호출 → EXP/드랍/퀘스트 업데이트
+
+### 예외/호환성
+
+* MythicMobs 업데이트 시 API 변화 체크(버전 고정 권장)
+* 몹 수가 많을 경우 MythicMobs 스킬 오브젝트 병목이 될 수 있으니 호출 빈도 조절
+
+### 테스트
+
+* 각 몹의 드랍 확률 1000샘플 시나리오 통계 확인
+* 특별 AI(예: 도둑)의 성공률·공정성 검증
+
+---
+
+## E. NPC & QuestSystem (스토리·상호작용)
+
+**목적**: npc.txt 기반 NPC 배치와 대사·퀘스트 흐름을 중앙화.
+
+### NPC 메타
+
+* npcId, name, role, location(floorId, region), dialogues {difficulty: [...]}
+* questGiver flag, shopFlag, trainerFlag
+
+### Quest 데이터 모델
+
+* questId, title, type(kill/collect/escort/dialogue/puzzle), steps[{type, target, amount, description}], rewards[{exp, item, title, unlockFlag}], failConditions, repeatableFlag
+
+### 인터랙션 흐름
+
+1. 플레이어 접근 → zNPCs로 대사 출력(난이도 기반 대사 선택)
+2. 퀘스트 수락 → `PlayerSystem.questProgress` 등록
+3. 퀘스트 진행(몹처치 등) → `onKill` / `onPickup` 이벤트로 자동 체크
+4. 완료 시 NPC 반환 대사 + 보상 지급
+
+### 특수: 난이도별 분기
+
+* 같은 NPC라도 난이도별로 다르게 행동(예: Hard에서 구출 실패 확률 있음)
+* Alon: NPC 대부분 비활성(대신 일지/환경으로 서사 제공)
+
+### 관리자 도구
+
+* `/mig quest forcecomplete <player> <quest>`
+* 퀘스트 스폰/리셋 툴 (특정 지점 재시작)
+
+### 테스트
+
+* 퀘스트 단계별 트리거 누락 없음(모든 경로 커버)
+* 실패 시 롤백(문제 발생 시 재시도 가능)
+
+---
+
+## F. DifficultySystem (난이도 엔진)
+
+**목적**: 플레이어가 선택한 난이도에 따라 전 영역의 규칙을 해석·조정.
+
+### 난이도 영향 항목(구체 목록)
+
+* 몹: HP 배율, DMG 배율, 스폰 빈도, 엘리트 확률
+* 기믹: 데미지/시간/난이도 트리거의 민감도
+* NPC: 대사·거래·출현 여부
+* 보상: 골드·아이템 드랍 량(하드에서 보상 상승)
+* 시스템 메시지: Alon에선 안내 메시지 비활성화
+* 페널티/리스크: 하드에서 레아 같은 퀘스트 NPC 생존률 낮아짐
+
+### 구현 포인트
+
+* 난이도는 플레이어 속성으로 고정(변경 시 높은 비용 또는 영구 패널티)
+* 난이도별 로그·통계 수집(플레이어가 어떤 난이도에서 더 오래 머무르는지)
+
+### 테스트 지표
+
+* 난이도별 클리어율(동일 파티 조건에서 비교)
+* 플레이어 만족도(베타 설문)
+
+---
+
+## G. EventSystem (세계 이벤트 / 엔드게임 분기)
+
+**목적**: 설정.txt의 세계관 이벤트(고신 파편, 봉인 위협, 엔딩 분기)를 실시간 제어.
+
+### 주요 이벤트 예시
+
+* 고신 파편 획득 → 정신오염 수치 증가 스택
+* 특정 층의 보스 패배/승리 → 전역 플래그 변경(스토리 분기)
+* 플레이어 선택(질서/혼돈/인간/진실) 기록 → 엔딩 조건 충족 시 각 루트 트리거
+
+### 디자인 포인트
+
+* 이벤트는 **플래그 기반**으로 관리(전역·파티·플레이어 단위)
+* 이벤트 트리거는 재연성 보장(예: 한번 실패해도 재시도 가능하도록 설계)
+
+### 관리자 툴
+
+* `/mig event trigger <eventId>`
+* `/mig event status` → 현재 전역 플래그 목록
+
+### 수용기준
+
+* 엔딩 분기별 출력 콘텐츠(컷·NPC·월드 변경)가 의도대로 발동
+
+---
+
+## H. Admin Tools & 운영 모듈
+
+**목적**: 운영·디버그·밸런스 조정을 위한 실무 도구 제공.
+
+### 필수 관리자 명령 목록 (간략)
+
+* `/mig admin status` : 서버 전체 메타(플레이어 수, active floors, tps)
+* `/mig admin player dump <player>`
+* `/mig admin boss spawn <bossId> [floorId]`
+* `/mig admin setflag <flag> <value>`
+* `/mig admin balance <param> <value>` : 실시간 밸런스 파라미터 조정(예: mob.hp.multiplier=1.2)
+
+### 로그·모니터링
+
+* 주요 이벤트(보스 사망, 퀘스트 완료, 치명적 오류) 전용 로그 파일(rolling)
+* CoreProtect 연동으로 이상행위 추적
+* spark 프로파일 스냅샷 촬영 명령
+
+### 백업/복구
+
+* 자동 백업: daily full, hourly incremental
+* 수동 백업 명령: `/mig admin backup now`
+* 복구 시: 데이터 무결성 검사 스크립트(체크섬)
+
+---
+
+## I. Persistence & Config 패턴
+
+**원칙**: 모든 게임 룰(스킬·층·몹·퀘스트)은 외부 데이터(예: `skills.yml`, `dungeons.yml`, `mobs-mythic.yml`)로 관리. 코드 수정 없이 파일로 컨텐츠 추가 가능해야 함.
+
+### 권장 파일 구성(예)
+
+* `config.yml` (전역 파라미터, 퍼포먼스 관련)
+* `players.sqlite` (플레이어 데이터)
+* `skills.yml`
+* `dungeons.yml`
+* `npc.yml`
+* `quests.yml`
+* `mobs/` (MythicMobs 연동 파일)
+* `logs/`, `backups/`
+
+### 마이그레이션 전략
+
+* 버전 필드 포함(예: skills.yml version: 1.0)
+* 업데이트 시 마이그레이터 스크립트로 자동 변환
+
+---
+
+## J. UI/UX 설계(플레이어 관점)
+
+* **핵심 원칙**: 복잡한 정보는 GUI로, 긴 설명은 아이템 설명(툴팁)으로 제공.
+* **주요 GUI**
+
+  * 스킬 창: 카테고리(보유/조건/미획득) + 조건 % 표기
+  * 퀘스트 창: 단계별 체크리스트 + 위치 표시(미니맵 동기 불가 시 텍스트 힌트)
+  * 던전 인포 창: 현재 층 상태, 남은 몹 카운트, 활성 기믹
+* **알림 방식**
+
+  * 중요: 타이틀(큰 자막) + 사운드
+  * 보통: 액션바 + 채팅 로그
+  * 실패/디버프: 짧은 반복 알림(스패밍 방지, 쿨타임 10s)
+
+---
+
+# 4) 컨텐츠 파이프라인 (기존 txt → 실제 설정으로 전환)
+
+**목표**: Han이 올려둔 설정.txt / 스킬.txt / 맵.txt / 몹.txt / npc.txt 파일을 채우기 쉬운 절차
+
+### 변환 단계(수작업 + 스크립트)
+
+1. **정리**: txt 파일을 층·몹·스킬 별 CSV로 정리(스키마 컬럼 정의)
+2. **검수**: 각 항목(이름·ID·등급 등) 중복/오타 체크
+3. **매핑**: CSV → `skills.yml` / MythicMobs 포맷 / `dungeons.yml` 매핑 템플릿에 입력
+4. **샘플 로드**: 1~10층 데이터로 플러그인에서 로드 테스트
+5. **밸런스**: 내부 플레이테스트로 밸런스 파라미터 조정
+6. **배포**: 파일 버전 관리(Git or zip release)
+
+---
+
+# 5) 성능·안정성 고려(라즈베리파이)
+
+* **엔티티/네트워크 제한**: floor별 엔티티 cap + global entity cap 적용
+* **비동기 처리**: DB I/O, 롤백/백업, 로그 집계 등은 비동기 큐로 처리
+* **Chunk Preload**: 상시 사용되는 층은 서버 시작 시 선로딩
+* **치명적 작업 차단**: 대량 이펙트·파티 소환은 TPS 체크 후 거부(운영자 오버라이드 가능)
+* **모니터링**: spark + cron tps 체크 → 자동 리포트(로그)
+
+---
+
+# 6) 테스트 전략(구체적 시나리오)
+
+* **단위 테스트(Dev 환경)**: SkillUnlockManager 단위 검사(조건별)
+* **통합 테스트(로컬 서버)**:
+
+  * 스폰/스폰 중지 반복 1000회
+  * 보스 페이즈 전환 100회
+  * 퀘스트 완료 시 보상 중복 미발생 확인
+* **플레이테스트(알파)**:
+
+  * 1인 플레이: 1~10층 완주(목적: 논리적 버그/스토리 누락)
+  * 5인 플레이: 동시성 검증(몬스터 수, 퀘스트 경쟁)
+  * 20인 스트레스 테스트: TPS 유효성 확인(엔티티 캡 조정)
+* **버그 수용 조건**: 치명적 CBT(데이터 손실/무한로딩) 없음, 보스 기믹 90% 재현성
+
+---
+
+# 7) 운영·라이브 밸런스 프로세스
+
+* **로그 수집**: 보스 전투 시간, 죽음 카운트, 퀘스트 실패율 수집
+* **주간 패치 루틴**:
+
+  1. 수치 데이터 수집(주간)
+  2. 밸런스 회의(핵심 파라미터 수정 후보 선정)
+  3. 테스트 서버에 반영(비공개)
+  4. 공개 패치(버전 증가, 마이그레이터 실행)
+* **유저 피드백 채널**: Discord + 인게임 `/report bug` 명령
+
+---
+
+# 8) 예외·리스크 및 완화책 (요약)
+
+* **데이터 손상**: 자동 백업·체크섬 + 복구 시나리오 문서화
+* **TPS 하락**: 엔티티 cap, 스폰 제어, 기믹 disable 토글 마련
+* **플러그인 충돌**: 의존성 목록 고정(예: MythicMobs 버전 고정), 업데이트 전 테스트 서버 검증
+* **밸런스 붕괴**: 실시간 파라미터 조정 기능과 롤백 플랜
+
+---
+
+# 9) 산출물(기획 산출물 목록 — Han이 받을 것)
+
+1. **정의 문서 세트(이것)**: 모듈별 상세 기획서 (플레이어·스킬·던전·퀘스트 등)
+2. **데이터 스키마 템플릿**: `skills.yml` / `dungeons.yml` / `npc.yml` 필드 정의(문서)
+3. **관리자 명령/GUI 스펙**: 모든 관리자 명령 목록, 파라미터, 권한 요구
+4. **테스트 케이스·시나리오**: 알파/베타/스케일 테스트 체크리스트
+5. **운영 가이드**: 백업정책, 패치 절차, 성능 튜닝 파라미터
+
+---
+
+1. config.yml (전역 설정)
+
+역할: 플러그인 전반의 공통 파라미터와 서버 최적화 옵션을 정의
+
+필드
+
+pluginVersion : 현재 플러그인 버전 (예: 1.0.0)
+
+database : 데이터 저장 방식 (SQLite / MySQL, 접속정보 포함)
+
+difficultyDefaults : 각 난이도의 전역 배율
+
+hpMultiplier
+
+damageMultiplier
+
+expRate
+
+dropRate
+
+performance : 서버 성능 관련 옵션
+
+entityCapPerFloor (층별 최대 엔티티 수)
+
+autoUnloadInactiveFloors (비활성 층 언로드 여부)
+
+cacheFlushInterval (DB 저장 주기, 초 단위)
+
+logging : 로그 관련
+
+eventLogEnabled (주요 이벤트 로그 기록 여부)
+
+backupPolicy (자동 백업 주기)
+
+2. skills.yml (스킬 데이터)
+
+역할: 스킬.txt 기반으로 모든 스킬을 데이터 드리븐 방식으로 관리
+
+스킬 항목
+
+id : 고유 식별자 (ex: skill_sword_mastery)
+
+name : 표시 이름
+
+type : ACTIVE / PASSIVE / TRANSFORM
+
+tier : 기본 / 합체 / 진화 / 궁극
+
+unlockConditions : 해금 조건 목록
+
+요구 스탯
+
+요구 스킬 숙련도
+
+특정 몬스터 처치 수
+
+특정 퀘스트 완료 여부
+
+cost : 발동 비용
+
+mana / stamina / cooldown
+
+effect : 발동 효과 (범위, 데미지, 상태이상, 버프 등)
+
+visuals : 이펙트/사운드 연출
+
+stackingRules : 버프 중첩 규칙 (겹침 / 갱신 / 무시)
+
+notes : 추가 설명/세계관적 Flavor 텍스트
+
+3. dungeons.yml (층계/맵 설정)
+
+역할: 맵.txt 기반으로 층계별 환경, 기믹, 보스룸 정의
+
+층 항목
+
+id : floor_01~floor_100
+
+name : 층 이름 (예: 잊혀진 숲)
+
+world : 해당 층이 배치된 월드/리전 정보
+
+difficultyVariants : 난이도별 차별화 정의
+
+몹 체력 배율
+
+환경 기믹 유무
+
+NPC 등장 여부
+
+spawnTable : 몬스터 스폰 규칙
+
+몹 ID, 스폰 확률, 개체수 범위
+
+gimmicks : 기믹/트랩 정의
+
+유형 (트랩/퍼즐/환경)
+
+발동 조건
+
+효과 (디버프, 체력 감소, 길 막힘 등)
+
+bossRoom : 보스 관련 설정
+
+보스 ID
+
+등장 조건
+
+페이즈별 기믹
+
+보상 및 다음 층 연결
+
+lootTable : 층 전용 보상 아이템
+
+4. npc.yml (NPC 데이터)
+
+역할: npc.txt 기반 NPC들의 정보와 난이도별 차별화 정의
+
+NPC 항목
+
+id : npc_alisha
+
+name : NPC 이름
+
+role : 직업/신분 (상인, 정보상, 퀘스트 NPC 등)
+
+location : 등장 층/좌표
+
+dialogues : 대사 목록
+
+Easy / Normal / Hard / Alon 별로 분리
+
+shopInventory : 상인일 경우 판매 목록
+
+quests : 퀘스트 제공 여부
+
+behavior : 특징 (고정 위치, 랜덤 이동, 숨김 조건 등)
+
+5. quests.yml (퀘스트 데이터)
+
+역할: NPC/스토리 기반 퀘스트의 조건, 보상, 진행 단계를 기록
+
+퀘스트 항목
+
+id : quest_rescue_leah
+
+title : 표시 제목
+
+giver : 시작 NPC ID
+
+type : KILL / COLLECT / ESCORT / PUZZLE / DIALOGUE
+
+steps : 진행 단계 배열
+
+각 단계 조건(몬스터 처치 수, 아이템 수집, NPC 대화 등)
+
+설명(플레이어에게 보여줄 텍스트)
+
+rewards : 완료 보상
+
+경험치, 아이템, 칭호, 스킬 해금 등
+
+failConditions : 실패 조건 (NPC 사망, 시간제한 등)
+
+repeatable : 반복 가능 여부
+
+notes : 스토리 설명, 플레이어 선택 영향
